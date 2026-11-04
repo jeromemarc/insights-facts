@@ -1,0 +1,170 @@
+---
+# Generate an insights-client archive locally (no upload), extract it, and
+# publish selected archive contents as Ansible local facts, readable as
+# ansible_local.<insights_fact_name> on the next fact gathering.
+#
+# Full run (needs root, or passwordless sudo, for insights-client):
+#   ansible-playbook -i localhost, insights_facts.yml
+#
+# Test run against an existing archive (no collection, no root):
+#   ansible-playbook -i localhost, insights_facts.yml \
+#     -e insights_archive_src=/path/to/archive.tar.gz \
+#     -e insights_become=false \
+#     -e insights_work_dir=/tmp/insights-facts-test \
+#     -e insights_facts_dir=/tmp/insights-facts-test/facts.d
+
+- name: Populate ansible local facts from an insights-client archive
+  hosts: all
+  connection: local
+  gather_facts: false
+  become: "{{ insights_become }}"
+  vars:
+    insights_become: true
+    insights_work_dir: /var/tmp/insights-facts
+    insights_archive_src: ""            # if set, skip collection and use this archive
+    insights_archive: "{{ insights_work_dir }}/insights-{{ inventory_hostname }}.tar.gz"
+    insights_extract_dir: "{{ insights_work_dir }}/extract"
+    insights_facts_dir: /etc/ansible/facts.d
+    insights_fact_name: insights        # -> ansible_local.insights
+    # Basenames of archive members to pull into the fact. These are the
+    # insights_commands/ names as produced by insights-core; verify them
+    # against a real archive.
+    insights_wanted_files:
+      - uname_-a
+      - hostname_-f
+      - "rpm_-qa*"
+      - redhat-release
+      - machine-id
+
+  tasks:
+    # Never delete the archive we were asked to reuse (it may be the same path).
+    - name: Remove previous archive
+      ansible.builtin.file:
+        path: "{{ insights_archive }}"
+        state: absent
+      when: insights_archive_src != insights_archive
+
+    - name: Remove previous extraction
+      ansible.builtin.file:
+        path: "{{ insights_extract_dir }}"
+        state: absent
+
+    - name: Create work directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ insights_work_dir }}"
+        - "{{ insights_extract_dir }}"
+
+    - name: Generate archive with insights-client without uploading
+      ansible.builtin.command:
+        argv:
+          - insights-client
+          - --no-upload
+          - --output-file
+          - "{{ insights_archive }}"
+      when: insights_archive_src | length == 0
+      changed_when: true
+
+    - name: Use the provided archive instead of collecting one
+      ansible.builtin.copy:
+        src: "{{ insights_archive_src }}"
+        dest: "{{ insights_archive }}"
+        remote_src: true
+        mode: "0600"
+      when: insights_archive_src | length > 0 and insights_archive_src != insights_archive
+
+    - name: Extract archive
+      ansible.builtin.unarchive:
+        src: "{{ insights_archive }}"
+        dest: "{{ insights_extract_dir }}"
+        remote_src: true
+
+    - name: Locate the archive's data directory
+      ansible.builtin.find:
+        paths: "{{ insights_extract_dir }}"
+        recurse: true
+        file_type: directory
+        patterns: data
+      register: insights_data_dirs
+
+    - name: Ensure exactly one data directory was found
+      ansible.builtin.assert:
+        that: insights_data_dirs.files | length == 1
+        fail_msg: "Expected one data/ directory in the archive, found {{ insights_data_dirs.files | length }}"
+
+    - name: Set data directory path
+      ansible.builtin.set_fact:
+        insights_data_dir: "{{ insights_data_dirs.files[0].path }}"
+
+    - name: Find wanted files inside the data directory
+      ansible.builtin.find:
+        paths: "{{ insights_data_dir }}"
+        recurse: true
+        file_type: file
+        patterns: "{{ insights_wanted_files }}"
+      register: insights_found
+
+    - name: Read wanted files
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ insights_found.files }}"
+      loop_control:
+        label: "{{ item.path | replace(insights_data_dir ~ '/', '') }}"
+      register: insights_slurped
+
+    # Key by path relative to data/, not basename: the archive has two
+    # machine-id files (etc/machine-id and etc/insights-client/machine-id).
+    - name: Index file contents by path relative to data/
+      ansible.builtin.set_fact:
+        insights_by_path: >-
+          {{ (insights_by_path | default({})) | combine({
+               item.item.path | replace(insights_data_dir ~ '/', ''): item.content | b64decode | trim
+             }) }}
+      loop: "{{ insights_slurped.results }}"
+      loop_control:
+        label: "{{ item.item.path | replace(insights_data_dir ~ '/', '') }}"
+
+    # The rpm listing's file name embeds its whole --qf format string, so match by prefix.
+    - name: Select the installed package listing
+      ansible.builtin.set_fact:
+        insights_rpm_listing: >-
+          {{ insights_by_path | dict2items
+               | selectattr('key', 'match', '^insights_commands/rpm_-qa')
+               | map(attribute='value') | list | first | default('') }}
+
+    - name: Assemble fact data
+      ansible.builtin.set_fact:
+        insights_fact_data:
+          archive: "{{ insights_archive }}"
+          collected_at: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+          hostname: "{{ insights_by_path['insights_commands/hostname_-f'] | default('') }}"
+          uname: "{{ insights_by_path['insights_commands/uname_-a'] | default('') }}"
+          os_release: "{{ insights_by_path['etc/redhat-release'] | default('') }}"
+          machine_id: "{{ insights_by_path['etc/machine-id'] | default('') }}"
+          insights_machine_id: "{{ insights_by_path['etc/insights-client/machine-id'] | default('') }}"
+          installed_packages: "{{ insights_rpm_listing.splitlines() | sort }}"
+
+    - name: Ensure local facts directory exists
+      ansible.builtin.file:
+        path: "{{ insights_facts_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write local fact file
+      ansible.builtin.copy:
+        dest: "{{ insights_facts_dir }}/{{ insights_fact_name }}.fact"
+        content: "{{ insights_fact_data | to_nice_json }}\n"
+        mode: "0644"
+
+    - name: Re-gather local facts so they are visible in this run
+      ansible.builtin.setup:
+        gather_subset:
+          - local
+        fact_path: "{{ insights_facts_dir }}"
+
+    - name: Show resulting local fact
+      ansible.builtin.debug:
+        var: ansible_local[insights_fact_name]
